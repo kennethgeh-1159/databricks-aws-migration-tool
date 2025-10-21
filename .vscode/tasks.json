@@ -1,0 +1,100 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Setup: Create Virtual Environment",
+            "type": "shell",
+            "command": "python",
+            "args": ["-m", "venv", "venv"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Setup: Install Dependencies",
+            "type": "shell",
+            "command": "${workspaceFolder}/venv/bin/pip",
+            "args": ["install", "-r", "requirements.txt"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared"
+            },
+            "dependsOn": "Setup: Create Virtual Environment"
+        },
+        {
+            "label": "Code: Format with Black",
+            "type": "shell",
+            "command": "${workspaceFolder}/venv/bin/black",
+            "args": ["src/", "tests/", "app.py", "--line-length=88"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always"
+            }
+        },
+        {
+            "label": "Code: Lint with Flake8",
+            "type": "shell",
+            "command": "${workspaceFolder}/venv/bin/flake8",
+            "args": ["src/", "tests/", "app.py", "--max-line-length=88"],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always"
+            }
+        },
+        {
+            "label": "Test: Run All Tests",
+            "type": "shell",
+            "command": "${workspaceFolder}/venv/bin/pytest",
+            "args": ["tests/", "-v", "--cov=src", "--cov-report=html"],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always"
+            }
+        },
+        {
+            "label": "App: Run Streamlit",
+            "type": "shell",
+            "command": "${workspaceFolder}/venv/bin/streamlit",
+            "args": ["run", "app.py", "--server.port", "8501"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always"
+            },
+            "isBackground": true
+        },
+        {
+            "label": "Docker: Build Image",
+            "type": "shell",
+            "command": "docker",
+            "args": ["build", "-t", "databricks-migration-tool", "."],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always"
+            }
+        },
+        {
+            "label": "Git: Push to GitHub",
+            "type": "shell",
+            "command": "git",
+            "args": ["push", "origin", "main"],
+            "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always"
+            }
+        }
+    ]
+}

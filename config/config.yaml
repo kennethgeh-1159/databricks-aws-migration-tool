@@ -1,0 +1,246 @@
+# =============================================================================
+# Databricks AWS Migration Tool - Main Configuration
+# =============================================================================
+
+app:
+  name: "Databricks AWS Migration Tool"
+  version: "1.0.0"
+  description: "AI-powered tool for migrating Databricks workloads to AWS"
+  debug: ${DEBUG:false}
+  environment: ${ENVIRONMENT:development}
+
+# Databricks Configuration
+databricks:
+  api_version: "2.0"
+  timeout_seconds: 60
+  max_retries: 3
+  retry_delay_seconds: 1
+
+  # Workspace settings
+  workspace:
+    url: ${DATABRICKS_WORKSPACE_URL}
+    token: ${DATABRICKS_ACCESS_TOKEN}
+
+  # API endpoints
+  endpoints:
+    clusters: "/clusters"
+    workspace: "/workspace"
+    jobs: "/jobs"
+    libraries: "/libraries"
+    unity_catalog: "/unity-catalog"
+
+# AWS Configuration
+aws:
+  region: ${AWS_REGION:us-east-1}
+
+  # S3 Configuration
+  s3:
+    bucket: ${S3_BUCKET_NAME}
+    prefix: "databricks-migration"
+    storage_classes:
+      - STANDARD
+      - STANDARD_IA
+      - GLACIER_IR
+      - GLACIER_FR
+
+  # Glue Configuration
+  glue:
+    database: "migrated_databricks"
+    table_prefix: "db_"
+
+  # EMR Configuration
+  emr:
+    release_label: "emr-6.15.0"
+    applications:
+      - Name: "Spark"
+      - Name: "Hadoop"
+      - Name: "Hive"
+
+  # Bedrock Configuration
+  bedrock:
+    model_id: ${BEDROCK_MODEL_ID:anthropic.claude-3-sonnet-20240229-v1:0}
+    max_tokens: 4000
+    temperature: 0.1
+    timeout_seconds: 300
+
+# Migration Configuration
+migration:
+  # Batch processing
+  batch_size: ${BATCH_SIZE:100}
+  max_notebooks_per_batch: ${MAX_NOTEBOOKS_TO_ANALYZE:10}
+  max_tables_per_batch: ${MAX_TABLES_TO_MIGRATE:5}
+
+  # File processing
+  max_file_size_mb: 100
+  supported_formats:
+    - "py"
+    - "sql"
+    - "scala"
+    - "r"
+
+  # Conversion settings
+  conversion:
+    confidence_threshold: 0.8
+    enable_manual_review: true
+    preserve_comments: true
+
+  # Validation settings
+  validation:
+    enable_data_validation: true
+    sample_size_percent: 1.0
+    max_validation_time_minutes: 30
+
+# Cost Configuration
+costs:
+  # Databricks pricing (USD)
+  databricks:
+    dbu_hour: 0.40
+    compute_hour: 0.20
+    storage_gb_month: 0.30
+
+  # AWS pricing (USD, us-east-1)
+  aws:
+    # EMR Serverless
+    emr_serverless_vcpu_hour: 0.052624
+    emr_serverless_memory_gb_hour: 0.0057785
+    emr_serverless_storage_gb_hour: 0.000111
+
+    # S3 Storage
+    s3_standard_gb_month: 0.023
+    s3_ia_gb_month: 0.0125
+    s3_glacier_ir_gb_month: 0.004
+    s3_glacier_fr_gb_month: 0.0036
+
+    # Bedrock
+    bedrock_claude_input_1k_tokens: 0.003
+    bedrock_claude_output_1k_tokens: 0.015
+
+    # Glue
+    glue_dpu_hour: 0.44
+
+    # Data Transfer
+    data_transfer_out_gb: 0.09
+
+# Analysis Configuration
+analysis:
+  # Complexity scoring
+  complexity:
+    weights:
+      databricks_features: 0.3
+      dependencies: 0.2
+      code_patterns: 0.2
+      data_operations: 0.15
+      integrations: 0.15
+
+  # Risk assessment
+  risk:
+    thresholds:
+      low: 3
+      medium: 6
+      high: 8
+
+  # Code patterns to detect
+  patterns:
+    databricks_specific:
+      - "dbutils"
+      - "display("
+      - "%magic"
+      - "spark.databricks"
+      - "DeltaTable"
+      - "mlflow.databricks"
+
+    high_complexity:
+      - "custom_libraries"
+      - "external_apis"
+      - "complex_sql"
+      - "streaming"
+
+# Logging Configuration
+logging:
+  version: 1
+  disable_existing_loggers: false
+
+  formatters:
+    standard:
+      format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    detailed:
+      format: "%(asctime)s [%(levelname)s] %(name)s:%(lineno)d: %(message)s"
+
+  handlers:
+    console:
+      class: logging.StreamHandler
+      level: ${LOG_LEVEL:INFO}
+      formatter: standard
+      stream: ext://sys.stdout
+
+    file:
+      class: logging.handlers.RotatingFileHandler
+      level: DEBUG
+      formatter: detailed
+      filename: logs/migration_tool.log
+      maxBytes: 10485760  # 10MB
+      backupCount: 5
+
+  loggers:
+    src:
+      level: DEBUG
+      handlers: [console, file]
+      propagate: false
+
+    boto3:
+      level: WARNING
+      handlers: [console]
+      propagate: false
+
+    botocore:
+      level: WARNING
+      handlers: [console]
+      propagate: false
+
+  root:
+    level: ${LOG_LEVEL:INFO}
+    handlers: [console, file]
+
+# Security Configuration
+security:
+  # API security
+  api:
+    rate_limit: ${API_RATE_LIMIT:100}
+    timeout: ${REQUEST_TIMEOUT:30}
+
+  # Data encryption
+  encryption:
+    enable_at_rest: true
+    enable_in_transit: true
+
+  # Access control
+  access:
+    require_authentication: false
+    session_timeout_minutes: 60
+
+# Performance Configuration
+performance:
+  # Threading
+  threading:
+    max_workers: ${WORKER_THREADS:4}
+    timeout_seconds: 300
+
+  # Caching
+  cache:
+    enable: true
+    ttl_seconds: ${CACHE_TTL:3600}
+    max_size_mb: 100
+
+  # Memory management
+  memory:
+    max_heap_size_mb: 2048
+    gc_threshold: 0.8
+
+# Feature Flags
+features:
+  enable_bedrock_analysis: true
+  enable_cost_optimization: true
+  enable_data_validation: true
+  enable_parallel_processing: true
+  enable_progress_tracking: true
+  enable_result_caching: true
