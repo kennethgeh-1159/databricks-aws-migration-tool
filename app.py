@@ -389,10 +389,52 @@ def main():
         col1, col2, col3 = st.columns(3)
 
         with col1:
+            # Per-run Bedrock toggle (overrides config_manager for this run)
+            try:
+                default_bedrock = bool(
+                    config_manager.get("features", {}).get(
+                        "enable_bedrock_analysis", True
+                    )
+                )
+            except Exception:
+                default_bedrock = True
+
+            enable_bedrock_run = st.checkbox(
+                "Enable Bedrock analysis for this run",
+                value=default_bedrock,
+                help="Toggle calling Amazon Bedrock for enriched analysis (requires AWS credentials).",
+                key="enable_bedrock_run",
+            )
+
+            # Show a warning if user enables Bedrock but AWS credentials aren't available
+            if enable_bedrock_run:
+                try:
+                    import boto3
+
+                    if boto3.Session().get_credentials() is None:
+                        st.warning(
+                            "Bedrock enabled but no AWS credentials found in the environment. Analysis will attempt Bedrock and may fail."
+                        )
+                except Exception:
+                    st.warning(
+                        "Bedrock enabled but boto3 is not available in the environment. Install boto3 in the venv to enable Bedrock calls."
+                    )
+
             if st.button("Run Analysis", key="run_analysis"):
                 st.session_state["action"] = "run_analysis"
                 # Trigger the analysis flow (placeholder)
                 try:
+                    # Override the in-memory config flag for this run based on the checkbox
+                    try:
+                        # Ensure features dict exists
+                        cfg = config_manager.config
+                        cfg.setdefault("features", {})
+                        cfg["features"]["enable_bedrock_analysis"] = bool(
+                            enable_bedrock_run
+                        )
+                    except Exception:
+                        pass
+
                     migration_tool = initialize_migration_tool(app_config)
                     run_full_analysis(migration_tool)
                 except Exception as e:
@@ -1127,13 +1169,15 @@ def display_overview_tab(results):
                     "complexity": analysis.get("complexity"),
                     "risk": analysis.get("risk"),
                     "issues": ", ".join(issues_list) if issues_list else "",
-                    "suggestions": ", ".join(
-                        analysis.get("suggestions", [])
-                        if isinstance(analysis.get("suggestions"), list)
-                        else [analysis.get("suggestions")]
-                    )
-                    if analysis.get("suggestions")
-                    else "",
+                    "suggestions": (
+                        ", ".join(
+                            analysis.get("suggestions", [])
+                            if isinstance(analysis.get("suggestions"), list)
+                            else [analysis.get("suggestions")]
+                        )
+                        if analysis.get("suggestions")
+                        else ""
+                    ),
                     "size_kb": size_kb,
                     "confidence_pct": confidence_pct,
                     "confidence_label": confidence_label,
@@ -1305,6 +1349,24 @@ def display_notebooks_tab(results):
                 **(
                     (
                         lambda a, s: {
+                            # Bedrock status summary (used/model/error/not enabled)
+                            "Bedrock": (
+                                (
+                                    lambda b: (
+                                        "Used: {}".format(b.get("model_id"))
+                                        if b and b.get("ok")
+                                        else (
+                                            "Error: {}".format(b.get("error"))
+                                            if b and b.get("error")
+                                            else "Not enabled"
+                                        )
+                                    )
+                                )(
+                                    notebook_analyses_map.get(
+                                        nb.get("path", ""), {}
+                                    ).get("bedrock_enrichment")
+                                )
+                            ),
                             "confidence_pct": compute_confidence_score(
                                 a.get("complexity"),
                                 len(a.get("issues") or []),

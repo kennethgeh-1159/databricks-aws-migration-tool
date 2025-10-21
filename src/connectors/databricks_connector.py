@@ -122,6 +122,51 @@ class DatabricksConnector(BaseComponent):
             self.logger.debug(f"Sleeping {delay}s before retrying {url}")
             time.sleep(delay)
 
+    def _format_timestamp(self, value):
+        """Normalize various timestamp representations into ISO8601 string or None.
+
+        Accepts integer epoch (seconds or milliseconds), float, or ISO/date string.
+        Returns ISO formatted UTC string like 'YYYY-MM-DDTHH:MM:SSZ' or None if unparseable.
+        """
+        if value is None:
+            return None
+
+        try:
+            # numeric-like strings or numbers
+            if isinstance(value, str) and value.isdigit():
+                value_num = int(value)
+            elif isinstance(value, (int, float)):
+                value_num = int(value)
+            else:
+                # Try parsing strings via pandas if available
+                try:
+                    import pandas as pd
+
+                    ts = pd.to_datetime(value, utc=True, errors="coerce")
+                    if pd.notna(ts):
+                        return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+                except Exception:
+                    pass
+                return str(value)
+
+            # Determine seconds vs milliseconds
+            if value_num > 10**12:
+                ts_sec = value_num / 1000.0
+            elif value_num > 10**9:
+                ts_sec = value_num / 1000.0
+            else:
+                ts_sec = float(value_num)
+
+            from datetime import datetime, timezone
+
+            dt = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            try:
+                return str(value)
+            except Exception:
+                return None
+
     def validate_config(self) -> bool:
         """Validate Databricks configuration."""
         required_fields = ["databricks.workspace.url", "databricks.workspace.token"]
@@ -249,14 +294,27 @@ class DatabricksConnector(BaseComponent):
                                     except Exception:
                                         owner = None
 
+                                # Normalize created/modified timestamps where possible
+                                raw_modified = (
+                                    item.get("modified_at")
+                                    or item.get("updated_at")
+                                    or item.get("modified")
+                                    or item.get("last_modified")
+                                    or item.get("created_at")
+                                    or item.get("created_time")
+                                )
+                                raw_created = item.get("created_at") or item.get(
+                                    "created_time"
+                                )
+
                                 notebook_info = {
                                     "path": item["path"],
                                     "language": item.get("language", "PYTHON"),
                                     "content": content,
                                     "size": len(content),
                                     "object_id": item.get("object_id"),
-                                    "created_at": item.get("created_at"),
-                                    "modified_at": item.get("modified_at"),
+                                    "created_at": self._format_timestamp(raw_created),
+                                    "modified_at": self._format_timestamp(raw_modified),
                                     "owner": owner or "",
                                 }
                                 notebooks.append(notebook_info)
@@ -315,12 +373,24 @@ class DatabricksConnector(BaseComponent):
                             except Exception:
                                 owner = None
 
+                        raw_modified = (
+                            item.get("modified_at")
+                            or item.get("updated_at")
+                            or item.get("modified")
+                            or item.get("last_modified")
+                            or item.get("created_at")
+                            or item.get("created_time")
+                        )
+                        raw_created = item.get("created_at") or item.get("created_time")
+
                         notebook_info = {
                             "path": item["path"],
                             "language": item.get("language", "PYTHON"),
                             "content": content,
                             "size": len(content),
                             "object_id": item.get("object_id"),
+                            "created_at": self._format_timestamp(raw_created),
+                            "modified_at": self._format_timestamp(raw_modified),
                             "owner": owner or "",
                         }
                         notebooks.append(notebook_info)

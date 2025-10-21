@@ -6,35 +6,86 @@ suggest AWS equivalent approaches. Optionally calls Amazon Bedrock
 when enabled in config (features.enable_bedrock_analysis). Bedrock
 enrichment is best-effort and failures are returned in the
 `bedrock_enrichment` field without failing the analysis pipeline.
+
+This module implements a robust _call_bedrock_model that attempts
+multiple invocation shapes and writes a small diagnostic file
+(`data/results/bedrock_client_diag.json`) describing the client
+surface when a call cannot be performed. The diagnostic file does
+NOT include credentials or secret values.
+"""
+
+import os
+from typing import Any, Dict, List, Optional
+
+"""Notebook analysis utilities.
+
+Provides heuristic analysis for Databricks notebooks to identify
+Databricks-specific syntax, estimate complexity, flag issues, and
+suggest AWS equivalent approaches. Optionally calls Amazon Bedrock
+when enabled in config (features.enable_bedrock_analysis). Bedrock
+enrichment is best-effort and failures are returned in the
+`bedrock_enrichment` field without failing the analysis pipeline.
+
+This module implements a robust _call_bedrock_model that attempts
+multiple invocation shapes and writes a small diagnostic file
+(`data/results/bedrock_client_diag.json`) describing the client
+surface when a call cannot be performed. The diagnostic file does
+NOT include credentials or secret values.
 """
 
 import json
+import logging
 import os
 import re
 from typing import Any, Dict, List, Optional
 
-from utils.base import ConfigManager
+logger = logging.getLogger(__name__)
 
-# Expanded list of common Databricks-specific constructs to detect
+# Simple pattern map for Databricks-specific constructs
 DB_SPECIFIC_PATTERNS = {
-    "dbutils": r"\bdbutils\.",
-    "display": r"\bdisplay\(",
-    "displayHTML": r"\bdisplayHTML\(",
-    "dbutils_widgets": r"\bdbutils\.widgets\.",
-    "spark_sql_call": r"\bspark\.sql\(",
+    "dbutils": r"\bdbutils\b",
+    "display": r"\bdisplay\b",
+    "displayHTML": r"\bdisplayHTML\b",
     "sql_cell_magic": r"^%sql",
-    "mlflow": r"\bmlflow\.",
+    "pyspark": r"\bspark\.(read|sql|createDataFrame)\b",
+    "delta": r"\bdelta\.tables\b|\bDeltaTable\b",
 }
 
 
-def _call_bedrock_model(
-    prompt: str, config: ConfigManager, model_id: Optional[str] = None
-) -> Dict[str, Any]:
-    """Call AWS Bedrock model if configured.
+# Minimal ConfigManager typing hint to avoid importing heavy objects at module import
+class ConfigManagerLike(Dict):
+    pass
 
-    Returns a dictionary with either {'ok': True, 'model_id': .., 'result': parsed}
-    or {'error': '...'} when invocation fails. Parsing attempts to decode JSON
-    responses into Python objects when the model returns JSON text.
+
+def _write_bedrock_diag(diag: Dict[str, Any]):
+    """Write a small diagnostic file with client introspection (no secrets).
+
+    This helps debugging when users report an incompatible Bedrock client
+    surface. We deliberately only write attribute names and types; we do not
+    log credential values.
+    """
+    try:
+        os.makedirs("data/results", exist_ok=True)
+        path = os.path.join("data/results", "bedrock_client_diag.json")
+        with open(path, "w") as f:
+            json.dump(diag, f, indent=2)
+    except Exception:
+        logger.exception("failed to write bedrock diagnostic file")
+
+
+def _call_bedrock_model(
+    prompt: str,
+    config: Optional[ConfigManagerLike] = None,
+    model_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Best-effort call to Amazon Bedrock via boto3.
+
+    This function attempts multiple invocation styles to handle different
+    boto3/bedrock client variants. On failure it returns a structured error
+    dictionary instead of raising so the analysis pipeline remains resilient.
+
+    It also writes a diagnostic file with the client's attribute list when
+    a call cannot be made so we can adapt to user environments.
     """
     try:
         import boto3
@@ -42,9 +93,9 @@ def _call_bedrock_model(
     except Exception as e:
         return {"error": f"boto3 not available: {e}", "raw": None}
 
-    # allow model_id override
+    # Resolve configured model id
     bedrock_cfg = (
-        config.get("aws", {}).get("bedrock", {}) if hasattr(config, "get") else {}
+        config.get("aws", {}).get("bedrock", {}) if isinstance(config, dict) else {}
     )
     configured_model = model_id or (
         bedrock_cfg.get("model_id") if isinstance(bedrock_cfg, dict) else None
@@ -55,15 +106,14 @@ def _call_bedrock_model(
             "raw": None,
         }
 
-    # determine region from config or env
+    # determine region
     region = (
-        (config.get("aws", {}).get("region") if hasattr(config, "get") else None)
+        (config.get("aws", {}).get("region") if isinstance(config, dict) else None)
         or os.getenv("AWS_REGION")
         or os.getenv("AWS_DEFAULT_REGION")
     )
 
     try:
-        # Use a session so users can specify profile via AWS_PROFILE if desired
         session = boto3.Session()
         client = (
             session.client("bedrock", region_name=region)
@@ -75,36 +125,93 @@ def _call_bedrock_model(
     except Exception as e:
         return {"error": f"failed to construct Bedrock client: {e}", "raw": None}
 
+    # Introspect client shape for diagnostics (do not include sensitive values)
     try:
-        # The Bedrock SDK can vary; prefer invoke_model/modelId/body or invoke depending on SDK
-        response = client.invoke_model(
-            modelId=configured_model, body=prompt.encode("utf-8")
-        )
-    except TypeError:
-        # fallback naming
-        try:
-            response = client.invoke_model(
-                ModelId=configured_model, Body=prompt.encode("utf-8")
-            )
-        except Exception as e:
-            return {"error": f"bedrock call failed: {e}", "raw": None}
+        client_type = type(client).__name__
+        client_module = type(client).__module__
+        attrs = sorted(a for a in dir(client) if not a.startswith("__"))[:300]
+        diag = {"type": client_type, "module": client_module, "attributes": attrs}
+        _write_bedrock_diag(diag)
+    except Exception:
+        logger.exception("failed to introspect bedrock client")
+
+    # Try direct methods first
+    try:
+        if hasattr(client, "invoke_model"):
+            fn = getattr(client, "invoke_model")
+            try:
+                response = fn(modelId=configured_model, body=prompt.encode("utf-8"))
+            except TypeError:
+                response = fn(ModelId=configured_model, Body=prompt.encode("utf-8"))
+        elif hasattr(client, "invoke"):
+            fn = getattr(client, "invoke")
+            try:
+                response = fn(modelId=configured_model, body=prompt.encode("utf-8"))
+            except TypeError:
+                response = fn(ModelId=configured_model, Body=prompt.encode("utf-8"))
+        else:
+            # Try low-level _make_api_call with common op names
+            if hasattr(client, "meta") and hasattr(client.meta, "service_model"):
+                op_names = list(
+                    getattr(client.meta.service_model, "operation_names", [])
+                )
+            else:
+                op_names = []
+
+            candidate_ops = [
+                op
+                for op in ("InvokeModel", "Invoke", "invoke_model", "invoke")
+                if op in op_names
+            ]
+            if hasattr(client, "_make_api_call") and candidate_ops:
+                last_exc = None
+                for op in candidate_ops:
+                    for params in (
+                        {"modelId": configured_model, "body": prompt.encode("utf-8")},
+                        {"ModelId": configured_model, "Body": prompt.encode("utf-8")},
+                        {"modelId": configured_model, "body": prompt},
+                        {"ModelId": configured_model, "Body": prompt},
+                    ):
+                        try:
+                            response = client._make_api_call(op, params)
+                            raise StopIteration
+                        except StopIteration:
+                            break
+                        except Exception as e:
+                            last_exc = e
+                            continue
+                    else:
+                        continue
+                    break
+                # If we exhausted loops without setting response, fail
+                try:
+                    response  # type: ignore
+                except NameError:
+                    return {"error": f"bedrock call failed: {last_exc}", "raw": None}
+            else:
+                return {
+                    "error": "Bedrock client does not expose invoke_model or invoke",
+                    "raw": None,
+                }
+
     except Exception as e:
         return {"error": f"bedrock call failed: {e}", "raw": None}
 
-    # parse response body
+    # Parse response
     try:
-        body = response.get("body")
+        body = (
+            response.get("body")
+            if isinstance(response, dict)
+            else getattr(response, "body", None)
+        )
         if hasattr(body, "read"):
             raw = body.read()
         else:
             raw = body
 
-        # decode bytes
-        try:
-            decoded = (
-                raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
-            )
-        except Exception:
+        if isinstance(raw, (bytes, bytearray)):
+            decoded = raw.decode("utf-8", errors="replace")
+        else:
             decoded = str(raw)
 
         decoded = decoded.strip()
@@ -127,27 +234,19 @@ def analyze_notebook(
 ) -> Dict[str, Any]:
     """Basic heuristic analysis for Databricks notebooks.
 
-    Returns a dict with:
-    - complexity: simple/medium/complex
-    - issues: list of strings
-    - suggestions: list of strings
-    - detected_patterns: list of matched patterns
-    - risk: green/yellow/red
+    Returns a dict with: complexity, issues, suggestions, detected_patterns, risk, summary
     """
     issues: List[str] = []
     suggestions: List[str] = []
     detected: List[str] = []
 
-    # Detect patterns
     for name, pat in DB_SPECIFIC_PATTERNS.items():
         try:
             if re.search(pat, content, flags=re.MULTILINE):
                 detected.append(name)
         except re.error:
-            # ignore regex problems
             continue
 
-    # Heuristic complexity based on lines of code and keyword density
     loc = len(content.splitlines())
     complexity = "simple"
     if loc < 100:
@@ -157,39 +256,17 @@ def analyze_notebook(
     else:
         complexity = "complex"
 
-    # Detect DB-specific constructs and flag issues/suggestions
     if "dbutils" in detected or re.search(r"\bdbutils\.", content):
-        issues.append(
-            "Uses dbutils - these utilities are Databricks-specific. Consider replacing with AWS native helpers (boto3 for S3, AWS Glue catalog APIs, or wrapper utilities)."
-        )
-        suggestions.append(
-            "Replace dbutils calls with boto3 / custom wrappers or use Glue/Athena equivalents for data access."
-        )
+        issues.append("Uses dbutils - these utilities are Databricks-specific.")
+        suggestions.append("Replace dbutils calls with boto3 or AWS equivalents.")
 
     if "display" in detected or re.search(r"\bdisplay\(", content):
         suggestions.append(
-            "Uses display() for notebook visualization - on AWS consider rendering with matplotlib/plotly in notebooks or exporting results to dashboards (QuickSight) or building visualizations in a reporting layer."
+            "Uses display() - consider rendering in alternative AWS tooling."
         )
 
-    if re.search(r"^%sql", content, flags=re.MULTILINE) or "sql_cell_magic" in detected:
-        suggestions.append(
-            "SQL cells detected - map to Glue/Athena/Redshift SQL depending on the target architecture; convert cell magics into programmatic SQL statements executed via boto3/pyathena or Spark on EMR."
-        )
-
-    if re.search(r"\bmlflow\.", content):
-        suggestions.append(
-            "Uses MLflow - on AWS you can use SageMaker Model Registry or integrate MLflow with S3/Glue and SageMaker for model lifecycle management."
-        )
-
-    # Additional quick checks
-    if "displayHTML" in detected:
-        suggestions.append(
-            "displayHTML found - review any HTML/JS embedded in notebooks for unsupported browser integrations."
-        )
-
-    # Risk color
     risk = "green"
-    if complexity == "complex" or any(i for i in issues):
+    if complexity == "complex" or issues:
         risk = "red"
     elif complexity == "medium":
         risk = "yellow"
@@ -213,17 +290,17 @@ def analyze_notebook(
 
 
 def analyze_notebooks_batch(
-    notebooks: List[Dict[str, Any]], config: Optional[ConfigManager] = None
+    notebooks: List[Dict[str, Any]], config: Optional[ConfigManagerLike] = None
 ) -> List[Dict[str, Any]]:
-    results = []
+    results: List[Dict[str, Any]] = []
     bedrock_enabled = False
-    if config:
-        try:
+    try:
+        if config and isinstance(config, dict):
             bedrock_enabled = bool(
-                config.get("features.enable_bedrock_analysis", False)
+                config.get("features", {}).get("enable_bedrock_analysis", False)
             )
-        except Exception:
-            bedrock_enabled = False
+    except Exception:
+        bedrock_enabled = False
 
     for n in notebooks:
         content = n.get("content", "")
@@ -241,6 +318,7 @@ def analyze_notebooks_batch(
             res["bedrock_enrichment"] = enrich
         else:
             res["bedrock_enrichment"] = {"note": "not enabled"}
-        # Wrap analysis with the original notebook metadata to match expected structure
+
         results.append({"notebook": n, "analysis": res})
+
     return results
