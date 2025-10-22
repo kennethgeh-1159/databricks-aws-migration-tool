@@ -39,6 +39,8 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+import requests
+
 logger = logging.getLogger(__name__)
 
 # Simple pattern map for Databricks-specific constructs
@@ -112,6 +114,103 @@ def _call_bedrock_model(
         or os.getenv("AWS_REGION")
         or os.getenv("AWS_DEFAULT_REGION")
     )
+
+    # Check for optional API-key based Bedrock invocation (x-api-key header)
+    api_key = (
+        bedrock_cfg.get("api_key") if isinstance(bedrock_cfg, dict) else None
+    ) or os.getenv("BEDROCK_API_KEY")
+    # Allow override of the base endpoint via config: aws.bedrock.endpoint
+    endpoint_cfg = (
+        bedrock_cfg.get("endpoint") if isinstance(bedrock_cfg, dict) else None
+    )
+
+    if api_key:
+        # Build candidate base endpoints
+        candidates = []
+        if endpoint_cfg:
+            candidates.append(endpoint_cfg.rstrip("/"))
+        if region:
+            candidates.append(f"https://bedrock.{region}.amazonaws.com")
+        # global fallback
+        candidates.append("https://bedrock.amazonaws.com")
+
+        headers = {
+            "x-api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+        payload = {
+            "input": prompt,
+            "modelId": configured_model,
+            "maxTokens": (
+                bedrock_cfg.get("max_tokens") if isinstance(bedrock_cfg, dict) else None
+            ),
+            "temperature": (
+                bedrock_cfg.get("temperature")
+                if isinstance(bedrock_cfg, dict)
+                else None
+            ),
+        }
+
+        timeout = (
+            bedrock_cfg.get("timeout_seconds", 300)
+            if isinstance(bedrock_cfg, dict)
+            else 300
+        )
+
+        last_exc = None
+        for base in candidates:
+            # Try the most common path first
+            for path in (
+                f"/models/{configured_model}/invoke",
+                f"/model/{configured_model}/invoke",
+                "/invocations",
+            ):
+                url = base + path
+                try:
+                    resp = requests.post(
+                        url, headers=headers, json=payload, timeout=timeout
+                    )
+                except Exception as e:
+                    last_exc = e
+                    continue
+
+                try:
+                    text = resp.text
+                    if resp.status_code >= 200 and resp.status_code < 300:
+                        try:
+                            parsed = resp.json()
+                        except Exception:
+                            parsed = {"text": text}
+
+                        return {
+                            "ok": True,
+                            "model_id": configured_model,
+                            "result": parsed,
+                            "used_api_key": True,
+                            "endpoint": url,
+                            "status_code": resp.status_code,
+                        }
+                    else:
+                        # collect non-2xx as diagnostic but continue to boto3 fallback
+                        last_exc = Exception(f"http {resp.status_code}: {text}")
+                        continue
+                except Exception as e:
+                    last_exc = e
+                    continue
+
+        # If we reach here, http invocation with API key failed; record diag and continue to boto3
+        try:
+            _write_bedrock_diag(
+                {
+                    "note": "api_key_http_failed",
+                    "api_key_present": bool(api_key),
+                    "last_exception": repr(last_exc),
+                }
+            )
+        except Exception:
+            logger.exception("failed to write bedrock api_key diagnostic")
 
     try:
         session = boto3.Session()

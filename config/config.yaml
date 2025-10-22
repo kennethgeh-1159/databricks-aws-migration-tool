@@ -59,6 +59,10 @@ aws:
   # Bedrock Configuration
   bedrock:
     model_id: ${BEDROCK_MODEL_ID:anthropic.claude-3-sonnet-20240229-v1:0}
+    # Optional API key support: set BEDROCK_API_KEY in env to use direct HTTP
+    # invocation instead of AWS credentials (x-api-key header). Leave empty to
+    # use IAM credentials via boto3.
+    api_key: ${BEDROCK_API_KEY:}
     max_tokens: 4000
     temperature: 0.1
     timeout_seconds: 300
