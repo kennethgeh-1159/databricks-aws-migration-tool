@@ -17,6 +17,7 @@ src_path = Path(__file__).parent / "src"
 sys.path.insert(0, str(src_path))
 
 from connectors.databricks_connector import DatabricksConnector
+from analyzers.bedrock_analyzer import BedrockAnalyzer
 
 # Import our modules
 from utils.base import ConfigManager, LoggerSetup
@@ -734,25 +735,17 @@ def test_all_connections(app_config: Dict[str, Any]):
                 results["databricks"] = False
                 st.error(f"Databricks error: {str(e)}")
 
-            # Test Bedrock (placeholder - we'll implement this later)
+            # Test Bedrock (use BedrockAnalyzer for a clearer check)
             try:
-                import boto3
-                from botocore.exceptions import (
-                    NoCredentialsError,
-                    PartialCredentialsError,
+                # Initialize BedrockAnalyzer with configured region and model
+                ba = BedrockAnalyzer(
+                    region_name=app_config.get("aws_region"),
+                    model_id=app_config.get("bedrock_model"),
                 )
-
-                # Use session to check for credentials first to give a clearer message
-                session = boto3.Session()
-                creds = session.get_credentials()
-                if not creds:
-                    raise NoCredentialsError()
-
-                bedrock_client = session.client(
-                    "bedrock", region_name=app_config["aws_region"]
-                )
-                bedrock_client.list_foundation_models()
-                results["bedrock"] = True
+                tb = ba.test_bedrock_access()
+                results["bedrock"] = bool(tb.get("ok"))
+                if not tb.get("ok"):
+                    st.warning(f"Bedrock: {tb.get('error')}")
             except NoCredentialsError:
                 results["bedrock"] = False
                 st.warning(
@@ -926,10 +919,41 @@ def run_full_analysis(migration_tool):
                 if notebooks_result and getattr(notebooks_result, "data", None)
                 else []
             )
-            # Pass the global config_manager so analyzer can enable Bedrock and use config
+
+            # Initialize Bedrock analyzer instance for structured analysis if enabled
+            bedrock_structured = None
+            try:
+                bedrock_structured = BedrockAnalyzer(
+                    region_name=app_config.get("aws_region"),
+                    model_id=app_config.get("bedrock_model"),
+                )
+                bedrock_ok = bedrock_structured.test_bedrock_access().get("ok", False)
+            except Exception:
+                bedrock_structured = None
+                bedrock_ok = False
+
+            # First use existing heuristic batch analyzer (this will attach any bedrock_enrichment it can)
             notebook_analyses = analyze_notebooks_batch(
                 notebooks, config=config_manager
             )
+
+            # If runtime Bedrock structured analyzer is available, run a second, lightweight structured pass
+            if bedrock_ok and bedrock_structured:
+                for item in notebook_analyses:
+                    try:
+                        nb = item.get("notebook", {})
+                        content = nb.get("content", "")
+                        path = nb.get("path") or nb.get("object_path") or nb.get("name")
+                        structured = bedrock_structured.analyze_notebook_complexity(
+                            content, path=path
+                        )
+                        item.setdefault("analysis", {})[
+                            "bedrock_structured"
+                        ] = structured
+                    except Exception as e:
+                        item.setdefault("analysis", {})["bedrock_structured"] = {
+                            "error": str(e)
+                        }
 
             # Step 6: Generate results
             status_text.text("Step 6/7: Generating results and inventory...")
