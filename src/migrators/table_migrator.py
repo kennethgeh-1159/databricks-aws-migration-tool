@@ -162,3 +162,54 @@ except Exception as e:
 
             logger.exception("Failed to upload artifact to S3: %s", e)
             return False
+
+    def migrate_tables(
+        self, tables: list, bucket: Optional[str] = None, keep_delta: bool = True
+    ) -> None:
+        """
+        Orchestrates the migration artifact generation for a list of tables.
+
+        This will generate a JSON sidecar and a migration notebook for each table
+        and attempt to upload them to the specified S3 bucket (or the default
+        bucket configured). It does not execute the notebook inside Databricks;
+        the generated notebook is intended to be imported and run in the
+        Databricks workspace (or submitted as a job).
+        """
+        bucket = bucket or self.default_bucket
+
+        for table in tables:
+            try:
+                sidecar = self.generate_sidecar(table)
+                sidecar_key = (
+                    f"migrated-tables/{self._safe_table_name_prefix(table)}/schema.json"
+                )
+                sidecar_content = json.dumps(sidecar, indent=2).encode("utf-8")
+
+                notebook = self.generate_copy_notebook(table, bucket, keep_delta)
+                notebook_key = f"migrated-tables/{self._safe_table_name_prefix(table)}/migrate_notebook.py"
+                notebook_content = notebook.encode("utf-8")
+
+                # Upload sidecar
+                if self.upload_artifact(sidecar_content, sidecar_key, bucket):
+                    logger.info(
+                        f"Uploaded schema sidecar for table {table.get('name')} to s3://{bucket}/{sidecar_key}"
+                    )
+                else:
+                    logger.warning(
+                        f"Failed to upload schema sidecar for table {table.get('name')} to s3://{bucket}/{sidecar_key}"
+                    )
+
+                # Upload notebook
+                if self.upload_artifact(notebook_content, notebook_key, bucket):
+                    logger.info(
+                        f"Uploaded migration notebook for table {table.get('name')} to s3://{bucket}/{notebook_key}"
+                    )
+                else:
+                    logger.warning(
+                        f"Failed to upload migration notebook for table {table.get('name')} to s3://{bucket}/{notebook_key}"
+                    )
+
+            except Exception as e:
+                logger.exception(
+                    f"Failed to generate or upload artifacts for table {table.get('name')}: {e}"
+                )

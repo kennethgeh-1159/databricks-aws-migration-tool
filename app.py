@@ -8,6 +8,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Dict
+import json
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -18,6 +19,7 @@ sys.path.insert(0, str(src_path))
 
 from connectors.databricks_connector import DatabricksConnector
 from analyzers.bedrock_analyzer import BedrockAnalyzer
+from migrators.table_migrator import TableMigrator
 
 # Import our modules
 from utils.base import ConfigManager, LoggerSetup
@@ -470,97 +472,173 @@ def main():
 
     elif page == "TCO Report":
         st.header("TCO Report")
-        # Placeholder TCO display
-        if st.session_state.get("action") == "generate_tco":
-            st.success("TCO report generated (placeholder)")
-            st.line_chart({"Cost": [1000, 800, 600, 400]})
-        else:
-            st.info("Click 'Generate TCO' on the Home page to create a report.")
-            import pandas as pd
+        # Build TCO report from session results (if present)
+        import pandas as pd
 
-            tables = results.get("tables", {}).get("tables", [])
-            clusters = results.get("clusters", {}).get("clusters", [])
+        results = st.session_state.get("migration_results") or {}
+        tables = (
+            results.get("tables", {}).get("tables", [])
+            if isinstance(results.get("tables"), dict)
+            else []
+        )
+        clusters = (
+            results.get("clusters", {}).get("clusters", [])
+            if isinstance(results.get("clusters"), dict)
+            else []
+        )
 
-            if not tables and not clusters:
-                st.info(
-                    "No table or cluster data available to compute TCO. Run analysis first."
+        if not tables and not clusters:
+            st.info(
+                "No table or cluster data available to compute TCO. Run analysis first."
+            )
+            return
+
+        # Import TCO helpers
+        from tco.tco import (
+            add_buffer,
+            bedrock_recommendations_placeholder,
+            estimate_databricks_costs_from_clusters,
+            estimate_storage_costs_from_tables,
+            generate_simple_roi,
+            map_to_aws_emr_estimate,
+            BUFFER_PERCENT,
+        )
+
+        # Parameters panel
+        with st.expander("TCO Parameters (click to expand)", expanded=False):
+            lookback_days = st.number_input(
+                "Lookback window (days)", min_value=1, max_value=90, value=30
+            )
+            dbu_price = st.number_input(
+                "DBU price (USD per DBU-hour)",
+                value=float(config_manager.get("costs.databricks.dbu_hour", 0.55)),
+            )
+            s3_price = st.number_input(
+                "S3 price (USD per GB-month)",
+                value=float(
+                    config_manager.get("costs.aws.s3_standard_gb_month", 0.023)
+                ),
+            )
+            buffer_pct = (
+                st.slider(
+                    "Buffer for unknowns (%)",
+                    min_value=0,
+                    max_value=50,
+                    value=int(BUFFER_PERCENT * 100),
                 )
-                return
-
-            # Estimate Databricks compute costs from clusters (last 30 days)
-            from tco.tco import (
-                add_buffer,
-                bedrock_recommendations_placeholder,
-                estimate_databricks_costs_from_clusters,
-                estimate_storage_costs_from_tables,
-                generate_simple_roi,
-                map_to_aws_emr_estimate,
+                / 100.0
             )
 
-            db_compute = estimate_databricks_costs_from_clusters(
-                clusters, lookback_days=30, config=config_manager
+        # Compute Databricks estimates
+        db_compute = estimate_databricks_costs_from_clusters(
+            clusters,
+            lookback_days=lookback_days,
+            dbu_price_per_hour=dbu_price,
+            config=config_manager,
+        )
+
+        storage = estimate_storage_costs_from_tables(tables, config=config_manager)
+
+        # Map to AWS EMR estimate
+        aws_emr = map_to_aws_emr_estimate(db_compute, config=config_manager)
+
+        # Apply buffer
+        db_compute_buffered = db_compute.get("compute_cost_usd", 0) * (1.0 + buffer_pct)
+        db_storage_buffered = storage.get("monthly_storage_cost_usd", 0) * (
+            1.0 + buffer_pct
+        )
+
+        aws_compute_buffered = aws_emr.get("compute_cost_usd", 0) * (1.0 + buffer_pct)
+        aws_storage_buffered = storage.get("monthly_storage_cost_usd", 0) * (
+            1.0 + buffer_pct
+        )
+
+        # Top-line metrics
+        col1, col2, col3 = st.columns(3)
+        col1.metric(
+            "Databricks Compute (30d DBU-hours)",
+            f"{db_compute.get('total_dbu_hours', 0):,.1f} DBU-hrs",
+        )
+        col2.metric(
+            "Databricks Compute Cost (monthly, buffered)",
+            f"${db_compute_buffered:,.2f}",
+        )
+        col3.metric(
+            "EMR Equivalent Compute Cost (monthly, buffered)",
+            f"${aws_compute_buffered:,.2f}",
+        )
+
+        col4, col5 = st.columns(2)
+        col4.metric("Delta Tables Size (GB)", f"{storage.get('total_gb', 0):,.2f} GB")
+        col5.metric(
+            "S3 Storage Cost (monthly, buffered)", f"${aws_storage_buffered:,.2f}"
+        )
+
+        # Side-by-side comparison table
+        comp = {
+            "Metric": ["Compute (monthly)", "Storage (monthly)", "Total Monthly"],
+            "Databricks (USD)": [
+                f"${db_compute_buffered:,.2f}",
+                f"${db_storage_buffered:,.2f}",
+                f"${(db_compute_buffered + db_storage_buffered):,.2f}",
+            ],
+            "AWS (USD)": [
+                f"${aws_compute_buffered:,.2f}",
+                f"${aws_storage_buffered:,.2f}",
+                f"${(aws_compute_buffered + aws_storage_buffered):,.2f}",
+            ],
+        }
+
+        comp_df = pd.DataFrame(comp)
+        st.markdown("#### Side-by-side cost comparison (with buffer)")
+        st.dataframe(comp_df, width="stretch")
+
+        # Per-cluster breakdown
+        st.markdown("#### Databricks cluster breakdown (estimated DBU-hours & cost)")
+        per_cluster = db_compute.get("per_cluster", [])
+        if per_cluster:
+            pc_df = pd.DataFrame(per_cluster)
+            pc_df["estimated_cost_usd"] = pc_df["estimated_cost_usd"].map(
+                lambda v: f"${v:,.2f}"
             )
+            pc_df["dbu_hours"] = pc_df["dbu_hours"].map(lambda v: f"{v:,.1f}")
+            st.dataframe(pc_df, width="stretch")
 
-            storage = estimate_storage_costs_from_tables(tables, config=config_manager)
+        # Storage details
+        st.markdown("#### Storage estimate")
+        st.write(f"Total bytes: {storage.get('total_bytes', 0):,}")
+        st.write(f"Total GB: {storage.get('total_gb', 0):,.2f} GB")
+        st.write(
+            f"Estimated monthly S3 cost (no buffer): ${storage.get('monthly_storage_cost_usd', 0):,.2f}"
+        )
 
-            # Map to AWS EMR cost estimate
-            aws_emr = map_to_aws_emr_estimate(db_compute, config=config_manager)
+        # ROI and projections
+        db_monthly = db_compute_buffered + db_storage_buffered
+        aws_monthly = aws_compute_buffered + aws_storage_buffered
+        roi = generate_simple_roi(db_monthly, aws_monthly)
 
-            # Add buffer
-            db_compute_buffered = add_buffer(db_compute.get("compute_cost_usd", 0))
-            db_storage_buffered = add_buffer(storage.get("monthly_storage_cost_usd", 0))
-
-            aws_compute_buffered = add_buffer(aws_emr.get("compute_cost_usd", 0))
-            aws_storage_buffered = add_buffer(
-                storage.get("monthly_storage_cost_usd", 0)
-            )
-
-            # Present results
-            comp = {
-                "Metric": ["Compute (monthly)", "Storage (monthly)", "Total Monthly"],
-                "Databricks (USD)": [
-                    f"${db_compute_buffered:,.2f}",
-                    f"${db_storage_buffered:,.2f}",
-                    f"${(db_compute_buffered + db_storage_buffered):,.2f}",
-                ],
-                "AWS (USD)": [
-                    f"${aws_compute_buffered:,.2f}",
-                    f"${aws_storage_buffered:,.2f}",
-                    f"${(aws_compute_buffered + aws_storage_buffered):,.2f}",
-                ],
-            }
-
-            comp_df = pd.DataFrame(comp)
-            st.markdown("#### Side-by-side cost comparison (with 15% buffer)")
-            st.dataframe(comp_df, width="stretch")
-
-            # Projections and ROI
-            db_monthly = db_compute_buffered + db_storage_buffered
-            aws_monthly = aws_compute_buffered + aws_storage_buffered
-            roi = generate_simple_roi(db_monthly, aws_monthly)
-
-            st.markdown("#### Projections & ROI")
-            st.markdown(f"- Databricks monthly (buffered): **${db_monthly:,.2f}**")
-            st.markdown(f"- AWS monthly (buffered): **${aws_monthly:,.2f}**")
+        st.markdown("#### Projections & ROI")
+        st.markdown(f"- Databricks monthly (buffered): **${db_monthly:,.2f}**")
+        st.markdown(f"- AWS monthly (buffered): **${aws_monthly:,.2f}**")
+        st.markdown(
+            f"- Estimated monthly savings: **${roi['monthly_savings_usd']:,.2f}**"
+        )
+        st.markdown(
+            f"- Estimated annual savings: **${roi['annual_savings_usd']:,.2f}**"
+        )
+        if roi.get("months_to_recover"):
             st.markdown(
-                f"- Estimated monthly savings: **${roi['monthly_savings_usd']:,.2f}**"
+                f"- Estimated months to recover migration cost: **{roi['months_to_recover']:.1f} months**"
             )
-            st.markdown(
-                f"- Estimated annual savings: **${roi['annual_savings_usd']:,.2f}**"
-            )
-            if roi.get("months_to_recover"):
-                st.markdown(
-                    f"- Estimated months to recover migration cost: **{roi['months_to_recover']:.1f} months**"
-                )
 
-            # AI-based cost optimization suggestions (Bedrock) — best-effort and guarded
-            st.markdown("#### AI Recommendations: Cost Optimization")
-            try:
-                tips = bedrock_recommendations_placeholder(db_compute)
-                for t in tips:
-                    st.info(t)
-            except Exception as e:
-                logger.error(f"Bedrock recommendation error: {e}", exc_info=True)
+        # AI cost tips
+        st.markdown("#### Cost optimization suggestions")
+        try:
+            tips = bedrock_recommendations_placeholder(db_compute)
+            for t in tips:
+                st.info(t)
+        except Exception as e:
+            logger.error(f"Bedrock recommendation error: {e}", exc_info=True)
 
     app_config["max_notebooks"] = st.slider(
         "Max Notebooks to Analyze",
@@ -1715,6 +1793,193 @@ def display_tables_tab(results):
                         st.text(f"... and {len(display_columns) - 50} more columns")
                 else:
                     st.info("No column metadata available for this table.")
+
+    # -------------------------
+    # Delta Table migration UI
+    # -------------------------
+    st.markdown("### 🔁 Delta Table Migration")
+
+    # get current sidebar/app configuration and initialize migrator
+    app_config = get_configuration()
+    migrator = TableMigrator(config)
+
+    # Build a list of fully-qualified table names for selection
+    all_fq_names = [
+        f"{t.get('catalog','unknown')}.{t.get('schema','default')}.{t.get('name','') }"
+        for t in tables
+    ]
+
+    selected_tables = st.multiselect(
+        "Select tables to generate migration artifacts for:", options=all_fq_names
+    )
+
+    if not selected_tables:
+        st.info("Select one or more tables above to generate migration artifacts.")
+    else:
+        col_a, col_b, col_c = st.columns([2, 2, 1])
+        with col_a:
+            target_bucket = st.text_input(
+                "Target S3 bucket (for uploads / artifact paths)",
+                value=app_config.get("s3_bucket")
+                or config.get("aws", {}).get("s3", {}).get("bucket", ""),
+            )
+        with col_b:
+            format_choice = st.selectbox(
+                "Export format",
+                options=["delta", "parquet"],
+                index=0,
+                help="Choose to keep Delta format or convert to Parquet",
+            )
+        with col_c:
+            do_upload = st.checkbox(
+                "Upload artifacts to S3 (requires boto3 & credentials)", value=False
+            )
+
+    if st.button("Generate migration artifacts"):
+        results = []
+        for fq in selected_tables:
+            # resolve fq back to table metadata
+            parts = fq.split(".")
+            catalog = parts[0] if len(parts) > 0 else ""
+            schema = parts[1] if len(parts) > 1 else ""
+            name = ".".join(parts[2:]) if len(parts) > 2 else ""
+
+            table_info = next(
+                (
+                    t
+                    for t in tables
+                    if t.get("catalog") == catalog
+                    and t.get("schema") == schema
+                    and t.get("name") == name
+                ),
+                None,
+            )
+
+            if not table_info:
+                st.warning(f"Could not find metadata for {fq}; skipping")
+                continue
+
+            try:
+                # Generate sidecar and notebook
+                sidecar = migrator.generate_sidecar(table_info)
+                notebook = migrator.generate_copy_notebook(
+                    table_info,
+                    bucket=target_bucket or None,
+                    keep_delta=(format_choice == "delta"),
+                )
+
+                sidecar_bytes = (json.dumps(sidecar, indent=2) + "\n").encode("utf-8")
+                nb_bytes = notebook.encode("utf-8")
+
+                prefix = migrator._safe_table_name_prefix(table_info)
+                sidecar_key = f"migrated-tables/{prefix}/schema.json"
+                notebook_key = f"migrated-tables/{prefix}/migrate_notebook.py"
+
+                upload_ok = False
+                notebook_upload_ok = False
+
+                if do_upload:
+                    uploaded_sidecar = migrator.upload_artifact(
+                        sidecar_bytes, sidecar_key, bucket=target_bucket or None
+                    )
+                    uploaded_notebook = migrator.upload_artifact(
+                        nb_bytes, notebook_key, bucket=target_bucket or None
+                    )
+                    upload_ok = bool(uploaded_sidecar)
+                    notebook_upload_ok = bool(uploaded_notebook)
+
+                results.append(
+                    {
+                        "fq_name": fq,
+                        "sidecar": sidecar,
+                        "notebook": notebook,
+                        "uploaded_sidecar": upload_ok,
+                        "uploaded_notebook": notebook_upload_ok,
+                        "sidecar_key": sidecar_key,
+                        "notebook_key": notebook_key,
+                    }
+                )
+
+            except Exception as e:
+                logger.exception("Failed generating artifacts for %s: %s", fq, e)
+                st.error(f"Failed generating artifacts for {fq}: {e}")
+
+        # Present results
+        for r in results:
+            st.markdown(f"#### {r['fq_name']}")
+            cols = st.columns([3, 2])
+            with cols[0]:
+                st.markdown("**Schema sidecar**")
+                st.json(r["sidecar"])
+                # Allow download of sidecar
+                st.download_button(
+                    label="Download schema.json",
+                    data=json.dumps(r["sidecar"], indent=2),
+                    file_name=f"{r['fq_name'].replace('.', '_')}_schema.json",
+                )
+
+            with cols[1]:
+                st.markdown("**Migration notebook**")
+                st.code(
+                    r["notebook"][:2000] + ("..." if len(r["notebook"]) > 2000 else ""),
+                    language="python",
+                )
+                st.download_button(
+                    label="Download migrate_notebook.py",
+                    data=r["notebook"],
+                    file_name=f"{r['fq_name'].replace('.', '_')}_migrate_notebook.py",
+                )
+
+            if do_upload:
+                if r["uploaded_sidecar"] or r["uploaded_notebook"]:
+                    st.success(
+                        f"Uploaded artifacts to s3://{target_bucket}/{r['sidecar_key']} and {r['notebook_key']}"
+                    )
+                else:
+                    st.warning(
+                        "Upload attempted but did not complete. Check logs, boto3 availability, and AWS credentials. Files are available to download below."
+                    )
+
+    # Direct migration action (uses TableMigrator.migrate_tables to generate & upload artifacts)
+    if st.button("Migrate selected tables to S3"):
+        # Build selected_table_data list
+        selected_table_data = []
+        for fq in selected_tables:
+            parts = fq.split(".")
+            catalog = parts[0] if len(parts) > 0 else ""
+            schema = parts[1] if len(parts) > 1 else ""
+            name = ".".join(parts[2:]) if len(parts) > 2 else ""
+            tinfo = next(
+                (
+                    t
+                    for t in tables
+                    if t.get("catalog") == catalog
+                    and t.get("schema") == schema
+                    and t.get("name") == name
+                ),
+                None,
+            )
+            if tinfo:
+                selected_table_data.append(tinfo)
+
+        if not selected_table_data:
+            st.error("No valid tables selected for migration.")
+        else:
+            with st.spinner(
+                "Starting migration: generating artifacts and uploading to S3..."
+            ):
+                try:
+                    migrator.migrate_tables(
+                        selected_table_data,
+                        bucket=target_bucket or None,
+                        keep_delta=(format_choice == "delta"),
+                    )
+                    st.success(
+                        "Migration artifacts generated and uploaded (where possible).\nNote: This uploads sidecars and migration notebooks to S3. To actually move data, run the generated notebook inside Databricks (import and execute the notebook or create a job to run it)."
+                    )
+                except Exception as e:
+                    logger.exception("Migration failed: %s", e)
+                    st.error(f"Migration failed: {e}")
 
 
 def display_jobs_tab(results):

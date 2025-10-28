@@ -184,25 +184,48 @@ class BedrockAnalyzer:
         # truncate prompt to avoid token limits
         truncated = self._truncate(prompt, self.DEFAULT_TRUNCATE)
 
+        # Choose sensible content types based on model provider heuristics.
+        # Anthropic models generally accept plain text; other models may prefer JSON.
+        content_type = "text/plain; charset=utf-8"
+        accept = "application/json, text/plain; charset=utf-8"
         try:
-            # Preferred modern signature: invoke_model(ModelId=..., Body=b'...')
+            if self.model_id and self.model_id.lower().startswith("anthropic"):
+                content_type = "text/plain; charset=utf-8"
+            else:
+                # Default to text/plain for compatibility, but allow JSON if needed.
+                content_type = "text/plain; charset=utf-8"
+
+            # Preferred modern signature: invoke_model(ModelId=..., Body=b'...', ContentType=..., Accept=...)
             if hasattr(self.runtime_client, "invoke_model"):
                 try:
                     resp = self.runtime_client.invoke_model(
-                        ModelId=self.model_id, Body=truncated.encode("utf-8")
+                        ModelId=self.model_id,
+                        Body=truncated.encode("utf-8"),
+                        ContentType=content_type,
+                        Accept=accept,
                     )
                 except TypeError:
+                    # Some sdk versions use different casing for params
                     resp = self.runtime_client.invoke_model(
-                        modelId=self.model_id, body=truncated.encode("utf-8")
+                        modelId=self.model_id,
+                        body=truncated.encode("utf-8"),
+                        contentType=content_type,
+                        accept=accept,
                     )
             elif hasattr(self.runtime_client, "invoke"):
                 try:
                     resp = self.runtime_client.invoke(
-                        modelId=self.model_id, body=truncated.encode("utf-8")
+                        modelId=self.model_id,
+                        body=truncated.encode("utf-8"),
+                        contentType=content_type,
+                        accept=accept,
                     )
                 except TypeError:
                     resp = self.runtime_client.invoke(
-                        ModelId=self.model_id, Body=truncated.encode("utf-8")
+                        ModelId=self.model_id,
+                        Body=truncated.encode("utf-8"),
+                        ContentType=content_type,
+                        Accept=accept,
                     )
             else:
                 # last resort: try low-level call names
@@ -212,7 +235,13 @@ class BedrockAnalyzer:
                     for op in op_candidates:
                         try:
                             resp = self.runtime_client._make_api_call(
-                                op, {"modelId": self.model_id, "body": truncated}
+                                op,
+                                {
+                                    "modelId": self.model_id,
+                                    "body": truncated.encode("utf-8"),
+                                    "contentType": content_type,
+                                    "accept": accept,
+                                },
                             )
                             break
                         except Exception as ex:
